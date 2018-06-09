@@ -31,7 +31,6 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/nightlyone/lockfile"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -94,7 +93,7 @@ type Appender interface {
 // a hashed partition of a seriedb.
 type DB struct {
 	dir   string
-	lockf *lockfile.Lockfile
+	lockf fileutil.Releaser
 
 	logger    log.Logger
 	metrics   *dbMetrics
@@ -210,14 +209,11 @@ func Open(dir string, l log.Logger, r prometheus.Registerer, opts *Options) (db 
 		if err != nil {
 			return nil, err
 		}
-		lockf, err := lockfile.New(filepath.Join(absdir, "lock"))
+		lockf, _, err := fileutil.Flock(filepath.Join(absdir, "lock"))
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "lock DB directory")
 		}
-		if err := lockf.TryLock(); err != nil {
-			return nil, errors.Wrapf(err, "open DB in %s", dir)
-		}
-		db.lockf = &lockf
+		db.lockf = lockf
 	}
 
 	db.compactor, err = NewLeveledCompactor(r, l, opts.BlockRanges, db.chunkPool)
@@ -522,6 +518,9 @@ func (db *DB) reload(deleteable ...string) (err error) {
 		blocks = append(blocks, b)
 		exist[meta.ULID] = struct{}{}
 	}
+	sort.Slice(blocks, func(i, j int) bool {
+		return blocks[i].Meta().MinTime < blocks[j].Meta().MinTime
+	})
 
 	if err := validateBlockSequence(blocks); err != nil {
 		return errors.Wrap(err, "invalid block sequence")
@@ -716,7 +715,7 @@ func (db *DB) Close() error {
 	merr.Add(g.Wait())
 
 	if db.lockf != nil {
-		merr.Add(db.lockf.Unlock())
+		merr.Add(db.lockf.Release())
 	}
 	merr.Add(db.head.Close())
 	return merr.Err()
@@ -836,34 +835,46 @@ func (db *DB) Delete(mint, maxt int64, ms ...labels.Matcher) error {
 }
 
 // CleanTombstones re-writes any blocks with tombstones.
-func (db *DB) CleanTombstones() error {
+func (db *DB) CleanTombstones() (err error) {
 	db.cmtx.Lock()
 	defer db.cmtx.Unlock()
 
 	start := time.Now()
 	defer db.metrics.tombCleanTimer.Observe(time.Since(start).Seconds())
 
+	newUIDs := []ulid.ULID{}
+	defer func() {
+		// If any error is caused, we need to delete all the new directory created.
+		if err != nil {
+			for _, uid := range newUIDs {
+				dir := filepath.Join(db.Dir(), uid.String())
+				if err := os.RemoveAll(dir); err != nil {
+					level.Error(db.logger).Log("msg", "failed to delete block after failed `CleanTombstones`", "dir", dir, "err", err)
+				}
+			}
+		}
+	}()
+
 	db.mtx.RLock()
 	blocks := db.blocks[:]
 	db.mtx.RUnlock()
 
-	deleted := []string{}
+	deletable := []string{}
 	for _, b := range blocks {
-		ok, err := b.CleanTombstones(db.Dir(), db.compactor)
-		if err != nil {
-			return errors.Wrapf(err, "clean tombstones: %s", b.Dir())
-		}
-
-		if ok {
-			deleted = append(deleted, b.Dir())
+		if uid, er := b.CleanTombstones(db.Dir(), db.compactor); er != nil {
+			err = errors.Wrapf(er, "clean tombstones: %s", b.Dir())
+			return err
+		} else if uid != nil { // New block was created.
+			deletable = append(deletable, b.Dir())
+			newUIDs = append(newUIDs, *uid)
 		}
 	}
 
-	if len(deleted) == 0 {
+	if len(deletable) == 0 {
 		return nil
 	}
 
-	return errors.Wrap(db.reload(deleted...), "reload blocks")
+	return errors.Wrap(db.reload(deletable...), "reload blocks")
 }
 
 func intervalOverlap(amin, amax, bmin, bmax int64) bool {
