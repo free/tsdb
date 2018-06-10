@@ -29,16 +29,18 @@ import (
 )
 
 type mockSeriesIterator struct {
-	seek func(int64) bool
-	at   func() (int64, float64)
-	next func() bool
-	err  func() error
+	seek       func(int64) bool
+	seekBefore func(int64) bool
+	at         func() (int64, float64)
+	next       func() bool
+	err        func() error
 }
 
-func (m *mockSeriesIterator) Seek(t int64) bool    { return m.seek(t) }
-func (m *mockSeriesIterator) At() (int64, float64) { return m.at() }
-func (m *mockSeriesIterator) Next() bool           { return m.next() }
-func (m *mockSeriesIterator) Err() error           { return m.err() }
+func (m *mockSeriesIterator) Seek(t int64) bool       { return m.seek(t) }
+func (m *mockSeriesIterator) SeekBefore(t int64) bool { return m.seekBefore(t) }
+func (m *mockSeriesIterator) At() (int64, float64)    { return m.at() }
+func (m *mockSeriesIterator) Next() bool              { return m.next() }
+func (m *mockSeriesIterator) Err() error              { return m.err() }
 
 type mockSeries struct {
 	labels   func() labels.Labels
@@ -82,6 +84,22 @@ func (it *listSeriesIterator) Seek(t int64) bool {
 		s := it.list[i+it.idx]
 		return s.t >= t
 	})
+
+	return it.idx < len(it.list)
+}
+
+func (it *listSeriesIterator) SeekBefore(t int64) bool {
+	if it.idx == -1 {
+		it.idx = 0
+	}
+	// Do binary search between current position and end.
+	idx := sort.Search(len(it.list)-it.idx, func(i int) bool {
+		s := it.list[i+it.idx]
+		return s.t >= t
+	})
+	if idx > it.idx {
+		it.idx = idx - 1
+	}
 
 	return it.idx < len(it.list)
 }

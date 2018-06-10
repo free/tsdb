@@ -671,6 +671,10 @@ type SeriesIterator interface {
 	// If there's no value exactly at t, it advances to the first value
 	// after t. Has no effect if already past t.
 	Seek(t int64) bool
+	// Seek advances the iterator forward to the given timestamp; just
+	// before; or just after; in that order.
+	// Has no effect if already past t.
+	SeekBefore(t int64) bool
 	// At returns the current timestamp/value pair.
 	At() (t int64, v float64)
 	// Next advances the iterator by one.
@@ -725,6 +729,21 @@ func (it *chainedSeriesIterator) Seek(t int64) bool {
 	return false
 }
 
+func (it *chainedSeriesIterator) SeekBefore(t int64) bool {
+	// We just scan the chained series sequentially as they are already
+	// pre-selected by relevant time and should be accessed sequentially anyway.
+	for i, s := range it.series[it.i:] {
+		cur := s.Iterator()
+		if !cur.SeekBefore(t) {
+			continue
+		}
+		it.cur = cur
+		it.i += i
+		return true
+	}
+	return false
+}
+
 func (it *chainedSeriesIterator) Next() bool {
 	if it.cur.Next() {
 		return true
@@ -760,6 +779,9 @@ type chunkSeriesIterator struct {
 
 	maxt, mint int64
 
+	lastT int64
+	lastV float64
+
 	intervals Intervals
 }
 
@@ -782,11 +804,15 @@ func newChunkSeriesIterator(cs []chunks.Meta, dranges Intervals, mint, maxt int6
 }
 
 func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
+	if it.cur.Err() != nil {
+		return false
+	}
 	if t > it.maxt {
 		it.i = len(it.chunks)
+		it.lastT = 0
 	}
-	if it.cur.Err() != nil || it.i >= len(it.chunks) {
-		return false
+	if it.i >= len(it.chunks) {
+		return it.lastT != 0
 	}
 
 	// Seek to the first valid value after t.
@@ -795,6 +821,9 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	}
 
 	// Return early if already past t.
+	if it.lastT >= t {
+		return true
+	}
 	if t0, _ := it.cur.At(); t0 >= t {
 		return t0 <= it.maxt
 	}
@@ -803,18 +832,17 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	for ; it.i < len(it.chunks); it.i++ {
 		// Skip chunks with MaxTime < t.
 		if it.chunks[it.i].MaxTime < t {
+			it.lastT = 0
 			continue
 		}
 
 		// Don't reset the iterator unless we've moved on to a different chunk.
 		if it.i != iCur {
-			it.cur = it.chunks[it.i].Chunk.Iterator()
-			if len(it.intervals) > 0 {
-				it.cur = &deletedIterator{it: it.cur, intervals: it.intervals}
-			}
+			it.cur = it.chunkIterator(it.i)
 		}
 
 		for it.cur.Next() {
+			it.lastT = 0
 			t0, _ := it.cur.At()
 			if t0 > it.maxt || it.cur.Err() != nil {
 				return false
@@ -827,47 +855,139 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	return false
 }
 
+func (it *chunkSeriesIterator) SeekBefore(t int64) (ok bool) {
+	if it.cur.Err() != nil {
+		return false
+	}
+	if t > it.maxt {
+		it.i = len(it.chunks)
+		it.lastT = 0
+	}
+	if it.i >= len(it.chunks) {
+		return it.lastT != 0
+	}
+
+	// Seek to the first valid value after mint.
+	if t < it.mint {
+		return it.Seek(it.mint)
+	}
+
+	// Return early if already past t.
+	if t0, _ := it.cur.At(); t0 >= t {
+		return it.lastT != 0 || t0 <= it.maxt
+	}
+
+	iCur := it.i
+	itCur := it.cur
+	it.lastT, it.lastV = it.At()
+	for ; it.i < len(it.chunks); it.i++ {
+		// Skip chunks with MaxTime < t.
+		if it.chunks[it.i].MaxTime < t {
+			it.lastT = 0
+			continue
+		}
+
+		// Don't reset the iterator unless we've moved on to a different chunk.
+		if it.i != iCur {
+			it.cur = it.chunkIterator(it.i)
+		}
+
+		for it.cur.Next() {
+			t0, v0 := it.cur.At()
+			if it.cur.Err() != nil {
+				return false
+			}
+			if t0 < t {
+				it.lastT, it.lastV = t0, v0
+				continue
+			}
+			if t0 == t {
+				it.lastT = 0
+				return true
+			}
+			// t0 > t
+			if it.lastT != 0 {
+				return true
+			}
+			// First sample in chunk, seek back through skipped chunks.
+			for j := it.i - 1; j >= iCur; j-- {
+				var itb chunkenc.Iterator
+				if j != iCur {
+					itb = it.chunkIterator(j)
+				} else {
+					itb = itCur
+				}
+				for itb.Next() {
+					it.lastT, it.lastV = itb.At()
+				}
+				if it.lastT != 0 {
+					return true
+				}
+			}
+			// Zero samples in skipped chunks, seek forward instead.
+			return it.Seek(t)
+		}
+	}
+	return it.lastT != 0
+}
+
 func (it *chunkSeriesIterator) At() (t int64, v float64) {
 	// Should it panic if it.cur.Err() != nil || it.i >= len(it.chunks)?
 	// What about before Next() or Seek() were called?
+	if it.lastT != 0 {
+		return it.lastT, it.lastV
+	}
 	return it.cur.At()
 }
 
 func (it *chunkSeriesIterator) Next() bool {
 	if it.cur.Err() != nil || it.i >= len(it.chunks) {
+		it.lastT = 0
 		return false
 	}
 
-	if it.cur.Next() {
-		t, _ := it.cur.At()
+	if it.lastT != 0 {
+		it.lastT = 0
+		return true
+	}
 
-		if t < it.mint {
-			if !it.Seek(it.mint) {
-				return false
+	for {
+		if it.cur.Next() {
+			t, _ := it.cur.At()
+
+			if t < it.mint {
+				if !it.Seek(it.mint) {
+					return false
+				}
+				t, _ = it.At()
 			}
-			t, _ = it.At()
+
+			return t <= it.maxt
+		}
+		if err := it.cur.Err(); err != nil {
+			return false
 		}
 
-		return t <= it.maxt
-	}
-	if err := it.cur.Err(); err != nil {
-		return false
-	}
-
-	it.i++
-	if it.i == len(it.chunks) {
-		return false
-	}
-	it.cur = it.chunks[it.i].Chunk.Iterator()
-	if len(it.intervals) > 0 {
-		it.cur = &deletedIterator{it: it.cur, intervals: it.intervals}
+		it.i++
+		if it.i == len(it.chunks) {
+			return false
+		}
+		it.cur = it.chunkIterator(it.i)
 	}
 
-	return it.Next()
+	return false
 }
 
 func (it *chunkSeriesIterator) Err() error {
 	return it.cur.Err()
+}
+
+func (it *chunkSeriesIterator) chunkIterator(i int) chunkenc.Iterator {
+	chunkIt := it.chunks[i].Chunk.Iterator()
+	if len(it.intervals) > 0 {
+		chunkIt = &deletedIterator{it: chunkIt, intervals: it.intervals}
+	}
+	return chunkIt
 }
 
 // deletedIterator wraps an Iterator and makes sure any deleted metrics are not
