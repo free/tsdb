@@ -671,10 +671,10 @@ type SeriesIterator interface {
 	// If there's no value exactly at t, it advances to the first value
 	// after t. Has no effect if already past t.
 	Seek(t int64) bool
-	// Seek advances the iterator forward to the given timestamp; just
-	// before; or just after; in that order.
+	// SeekInstant advances the iterator forward to the given timestamp;
+	// just before; or just after; in that order.
 	// Has no effect if already past t.
-	SeekBefore(t int64) bool
+	SeekInstant(t int64) bool
 	// At returns the current timestamp/value pair.
 	At() (t int64, v float64)
 	// Next advances the iterator by one.
@@ -729,12 +729,12 @@ func (it *chainedSeriesIterator) Seek(t int64) bool {
 	return false
 }
 
-func (it *chainedSeriesIterator) SeekBefore(t int64) bool {
+func (it *chainedSeriesIterator) SeekInstant(t int64) bool {
 	// We just scan the chained series sequentially as they are already
 	// pre-selected by relevant time and should be accessed sequentially anyway.
 	for i, s := range it.series[it.i:] {
 		cur := s.Iterator()
-		if !cur.SeekBefore(t) {
+		if !cur.SeekInstant(t) {
 			continue
 		}
 		it.cur = cur
@@ -786,21 +786,25 @@ type chunkSeriesIterator struct {
 }
 
 func newChunkSeriesIterator(cs []chunks.Meta, dranges Intervals, mint, maxt int64) *chunkSeriesIterator {
-	it := cs[0].Chunk.Iterator()
-
-	if len(dranges) > 0 {
-		it = &deletedIterator{it: it, intervals: dranges}
-	}
-	return &chunkSeriesIterator{
+	it := chunkSeriesIterator{
 		chunks: cs,
 		i:      0,
-		cur:    it,
 
 		mint: mint,
 		maxt: maxt,
 
 		intervals: dranges,
 	}
+	it.cur = it.chunkIterator(it.i)
+	return &it
+}
+
+func (it *chunkSeriesIterator) chunkIterator(i int) chunkenc.Iterator {
+	chunkIt := it.chunks[i].Chunk.Iterator()
+	if len(it.intervals) > 0 {
+		chunkIt = &deletedIterator{it: chunkIt, intervals: it.intervals}
+	}
+	return chunkIt
 }
 
 func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
@@ -855,7 +859,7 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	return false
 }
 
-func (it *chunkSeriesIterator) SeekBefore(t int64) (ok bool) {
+func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 	if it.cur.Err() != nil {
 		return false
 	}
@@ -980,14 +984,6 @@ func (it *chunkSeriesIterator) Next() bool {
 
 func (it *chunkSeriesIterator) Err() error {
 	return it.cur.Err()
-}
-
-func (it *chunkSeriesIterator) chunkIterator(i int) chunkenc.Iterator {
-	chunkIt := it.chunks[i].Chunk.Iterator()
-	if len(it.intervals) > 0 {
-		chunkIt = &deletedIterator{it: chunkIt, intervals: it.intervals}
-	}
-	return chunkIt
 }
 
 // deletedIterator wraps an Iterator and makes sure any deleted metrics are not
