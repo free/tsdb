@@ -1238,6 +1238,55 @@ func TestChunkSeriesIterator_SeekWithMinTime(t *testing.T) {
 	testutil.Assert(t, it.Seek(3) == false, "")
 }
 
+func assertAt(t *testing.T, it *chunkSeriesIterator, expT int64, expV float64) {
+	ts, v := it.At()
+	testutil.Equals(t, expT, ts)
+	testutil.Equals(t, expV, v)
+	testutil.Equals(t, nil, it.Err())
+}
+
+func TestChunkSeriesIterator_SeekInstant(t *testing.T) {
+	chkMetas := []chunks.Meta{
+		chunkFromSamples([]sample{{11, 12}, {13, 14}, {15, 16}}),
+		chunkFromSamples([]sample{{21, 22}, {23, 24}, {25, 26}}),
+		chunkFromSamples([]sample{{31, 32}, {33, 34}, {35, 36}}),
+		chunkFromSamples([]sample{}),
+		chunkFromSamples([]sample{{51, 52}, {53, 54}, {55, 56}}),
+	}
+	tombstones := Intervals{
+		{20, 30},
+	}
+
+	it := newChunkSeriesIterator(chkMetas, tombstones, 12, 54)
+	ts, v := it.At()
+	testutil.Equals(t, int64(math.MinInt64), ts)
+	testutil.Equals(t, 0.0, v)
+	testutil.Equals(t, nil, it.Err())
+
+	testutil.Assert(t, it.SeekInstant(10), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(13), ts)
+	testutil.Equals(t, 14.0, v)
+
+	// Test iterator doesn't advance.
+	testutil.Assert(t, it.SeekInstant(14), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(13), ts)
+	testutil.Equals(t, 14.0, v)
+
+	// Test iterator advances when buffering a last value.
+	testutil.Assert(t, it.SeekInstant(16), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(15), ts)
+	testutil.Equals(t, 16.0, v)
+
+	// Test iterator doesn't advance when buffering a last value.
+	testutil.Assert(t, it.SeekInstant(16), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(15), ts)
+	testutil.Equals(t, 16.0, v)
+}
+
 func TestPopulatedCSReturnsValidChunkSlice(t *testing.T) {
 	lbls := []labels.Labels{labels.New(labels.Label{"a", "b"})}
 	chunkMetas := [][]chunks.Meta{

@@ -15,6 +15,7 @@ package tsdb
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -793,6 +794,8 @@ func newChunkSeriesIterator(cs []chunks.Meta, dranges Intervals, mint, maxt int6
 		mint: mint,
 		maxt: maxt,
 
+		lastT: math.MinInt64,
+
 		intervals: dranges,
 	}
 	it.cur = it.chunkIterator(it.i)
@@ -808,18 +811,16 @@ func (it *chunkSeriesIterator) chunkIterator(i int) chunkenc.Iterator {
 }
 
 func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
-	if it.cur.Err() != nil {
+	if it.cur.Err() != nil || (it.i >= len(it.chunks) && !it.hasLast()) {
 		return false
 	}
+
+	// Bound t to [mint, maxt].
 	if t > it.maxt {
 		it.i = len(it.chunks)
-		it.lastT = 0
+		it.clearLast()
+		return false
 	}
-	if it.i >= len(it.chunks) {
-		return it.lastT != 0
-	}
-
-	// Seek to the first valid value after t.
 	if t < it.mint {
 		t = it.mint
 	}
@@ -828,6 +829,7 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	if it.lastT >= t {
 		return true
 	}
+	it.clearLast()
 	if t0, _ := it.cur.At(); t0 >= t {
 		return t0 <= it.maxt
 	}
@@ -836,17 +838,15 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 	for ; it.i < len(it.chunks); it.i++ {
 		// Skip chunks with MaxTime < t.
 		if it.chunks[it.i].MaxTime < t {
-			it.lastT = 0
 			continue
 		}
 
-		// Don't reset the iterator unless we've moved on to a different chunk.
+		// Reset the iterator if we've moved on to a different chunk.
 		if it.i != iCur {
 			it.cur = it.chunkIterator(it.i)
 		}
 
 		for it.cur.Next() {
-			it.lastT = 0
 			t0, _ := it.cur.At()
 			if t0 > it.maxt || it.cur.Err() != nil {
 				return false
@@ -860,39 +860,50 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 }
 
 func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
-	if it.cur.Err() != nil {
+	fmt.Printf("Seek(%d)\n", t)
+	if it.cur.Err() != nil || (it.i >= len(it.chunks) && !it.hasLast()) {
 		return false
 	}
+
+	// Fail if seeking beyond maxt.
 	if t > it.maxt {
 		it.i = len(it.chunks)
-		it.lastT = 0
-	}
-	if it.i >= len(it.chunks) {
-		return it.lastT != 0
+		it.clearLast()
+		return false
 	}
 
-	// Seek to the first valid value after mint.
+	// If iterator is done but have last value, return success.
+	if it.i >= len(it.chunks) {
+		return it.hasLast()
+	}
+
 	if t < it.mint {
+		// Seek to the first valid value after mint.
 		return it.Seek(it.mint)
 	}
 
 	// Return early if already past t.
+	if it.lastT >= t {
+		return true
+	}
 	if t0, _ := it.cur.At(); t0 >= t {
-		return it.lastT != 0 || t0 <= it.maxt
+		return it.hasLast()
 	}
 
 	iCur := it.i
 	itCur := it.cur
-	it.lastT, it.lastV = it.At()
+	it.lastT, it.lastV = it.cur.At()
 	for ; it.i < len(it.chunks); it.i++ {
-		// Skip chunks with MaxTime < t.
+		// Skip chunks with MaxTime < t, initially.
 		if it.chunks[it.i].MaxTime < t {
-			it.lastT = 0
+			it.clearLast()
 			continue
 		}
 
-		// Don't reset the iterator unless we've moved on to a different chunk.
+		// Reset the iterator if we've moved on to a different chunk.
 		if it.i != iCur {
+			tt, vv := it.cur.At()
+			fmt.Printf("Seek(%d): lastT=%d it.cur.At=%d %f\n", t, it.lastT, tt, vv)
 			it.cur = it.chunkIterator(it.i)
 		}
 
@@ -906,14 +917,15 @@ func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 				continue
 			}
 			if t0 == t {
-				it.lastT = 0
+				it.clearLast()
 				return true
 			}
 			// t0 > t
-			if it.lastT != 0 {
+			fmt.Printf("Seek(%d): t0=%d lastT=%d\n", t, t0, it.lastT)
+			if it.hasLast() {
 				return true
 			}
-			// First sample in chunk, seek back through skipped chunks.
+			// First sample in chunk, scan back skipped chunks for last value.
 			for j := it.i - 1; j >= iCur; j-- {
 				var itb chunkenc.Iterator
 				if j != iCur {
@@ -921,24 +933,29 @@ func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 				} else {
 					itb = itCur
 				}
+				// This only works because outside of this code, it.cur (and thus itb) is either:
+				//  (a) unpositioned, returning math.MinInt64;
+				//  (b) positioned on a valid value after Seek/SeekInstant/Next return;
+				//  (c) positioned on an invalid (e.g. deleted) value iff it.i == len(it.chunks);
+				it.lastT, it.lastV = itb.At()
 				for itb.Next() {
 					it.lastT, it.lastV = itb.At()
 				}
-				if it.lastT != 0 {
+				if it.hasLast() {
 					return true
 				}
 			}
 			// Zero samples in skipped chunks, seek forward instead.
-			return it.Seek(t)
+			return t0 <= it.maxt
 		}
 	}
-	return it.lastT != 0
+	return it.hasLast()
 }
 
 func (it *chunkSeriesIterator) At() (t int64, v float64) {
 	// Should it panic if it.cur.Err() != nil || it.i >= len(it.chunks)?
 	// What about before Next() or Seek() were called?
-	if it.lastT != 0 {
+	if it.hasLast() {
 		return it.lastT, it.lastV
 	}
 	return it.cur.At()
@@ -946,13 +963,14 @@ func (it *chunkSeriesIterator) At() (t int64, v float64) {
 
 func (it *chunkSeriesIterator) Next() bool {
 	if it.cur.Err() != nil || it.i >= len(it.chunks) {
-		it.lastT = 0
+		it.clearLast()
 		return false
 	}
 
-	if it.lastT != 0 {
-		it.lastT = 0
-		return true
+	if it.hasLast() {
+		it.clearLast()
+		t, _ := it.cur.At()
+		return t < it.maxt
 	}
 
 	for {
@@ -963,7 +981,7 @@ func (it *chunkSeriesIterator) Next() bool {
 				if !it.Seek(it.mint) {
 					return false
 				}
-				t, _ = it.At()
+				t, _ = it.cur.At()
 			}
 
 			return t <= it.maxt
@@ -985,6 +1003,228 @@ func (it *chunkSeriesIterator) Next() bool {
 func (it *chunkSeriesIterator) Err() error {
 	return it.cur.Err()
 }
+
+func (it *chunkSeriesIterator) hasLast() bool {
+	return it.lastT != math.MinInt64
+}
+
+func (it *chunkSeriesIterator) clearLast() {
+	it.lastT = math.MinInt64
+}
+
+//// chunkSeriesIterator implements a series iterator on top
+//// of a list of time-sorted, non-overlapping chunks.
+//type chunkSeriesIteratorB struct {
+//	it     chunkSeriesIterator
+//	itDone bool
+//
+//	maxt, mint int64
+//
+//	lastT int64
+//	lastV float64
+//}
+//
+//func newChunkSeriesIteratorB(cs []chunks.Meta, dranges Intervals, mint, maxt int64) *chunkSeriesIteratorB {
+//	return &chunkSeriesIteratorB{
+//		it: newChunkSeriesIterator(cs, dranges, mint, maxt),
+//
+//		mint: mint,
+//		maxt: maxt,
+//
+//		lastT: math.MinInt64,
+//	}
+//}
+//
+//func (it *chunkSeriesIteratorB) Seek(t int64) (ok bool) {
+//	if it.it.Err() != nil {
+//		return false
+//	}
+//
+//	// Bound t to [mint, maxt].
+//	if t > it.maxt {
+//		it.itDone = true
+//		it.clearLast()
+//		return false
+//	}
+//	if t < it.mint {
+//		t = it.mint
+//	}
+//
+//	// Return early if already past t.
+//	if it.lastT >= t {
+//		return true
+//	}
+//	// Or past the end of the iterator.
+//	if it.i >= len(it.chunks) {
+//		it.clearLast()
+//		return false
+//	}
+//	if t0, _ := it.cur.At(); t0 >= t {
+//		return t0 <= it.maxt
+//	}
+//
+//	iCur := it.i
+//	for ; it.i < len(it.chunks); it.i++ {
+//		// Skip chunks with MaxTime < t.
+//		if it.chunks[it.i].MaxTime < t {
+//			it.clearLast()
+//			continue
+//		}
+//
+//		// Don't reset the iterator unless we've moved on to a different chunk.
+//		if it.i != iCur {
+//			it.cur = it.chunkIterator(it.i)
+//		}
+//
+//		for it.cur.Next() {
+//			it.clearLast()
+//			t0, _ := it.cur.At()
+//			if t0 > it.maxt || it.cur.Err() != nil {
+//				return false
+//			}
+//			if t0 >= t {
+//				return true
+//			}
+//		}
+//	}
+//	return false
+//}
+//
+//func (it *chunkSeriesIteratorB) SeekInstant(t int64) (ok bool) {
+//	if it.cur.Err() != nil {
+//		return false
+//	}
+//	if t > it.maxt {
+//		it.i = len(it.chunks)
+//		it.clearLast()
+//	}
+//	if it.i >= len(it.chunks) {
+//		return it.hasLast()
+//	}
+//
+//	// Seek to the first valid value after mint.
+//	if t < it.mint {
+//		return it.Seek(it.mint)
+//	}
+//
+//	// Return early if already past t.
+//	if t0, _ := it.cur.At(); t0 >= t {
+//		return it.hasLast() || t0 <= it.maxt
+//	}
+//
+//	iCur := it.i
+//	itCur := it.cur
+//	it.lastT, it.lastV = it.At()
+//	for ; it.i < len(it.chunks); it.i++ {
+//		// Skip chunks with MaxTime < t.
+//		if it.chunks[it.i].MaxTime < t {
+//			it.clearLast()
+//			continue
+//		}
+//
+//		// Don't reset the iterator unless we've moved on to a different chunk.
+//		if it.i != iCur {
+//			it.cur = it.chunkIterator(it.i)
+//		}
+//
+//		for it.cur.Next() {
+//			t0, v0 := it.cur.At()
+//			if it.cur.Err() != nil {
+//				return false
+//			}
+//			if t0 < t {
+//				it.lastT, it.lastV = t0, v0
+//				continue
+//			}
+//			if t0 == t {
+//				it.clearLast()
+//				return true
+//			}
+//			// t0 > t
+//			if it.hasLast() {
+//				return true
+//			}
+//			// First sample in chunk, seek back through skipped chunks.
+//			for j := it.i - 1; j >= iCur; j-- {
+//				var itb chunkenc.Iterator
+//				if j != iCur {
+//					itb = it.chunkIterator(j)
+//				} else {
+//					itb = itCur
+//				}
+//				for itb.Next() {
+//					it.lastT, it.lastV = itb.At()
+//				}
+//				if it.hasLast() {
+//					return true
+//				}
+//			}
+//			// Zero samples in skipped chunks, seek forward instead.
+//			return it.Seek(t)
+//		}
+//	}
+//	return it.hasLast()
+//}
+//
+//func (it *chunkSeriesIteratorB) At() (t int64, v float64) {
+//	// Should it panic if it.cur.Err() != nil || it.i >= len(it.chunks)?
+//	// What about before Next() or Seek() were called?
+//	if it.hasLast() {
+//		return it.lastT, it.lastV
+//	}
+//	return it.cur.At()
+//}
+//
+//func (it *chunkSeriesIteratorB) Next() bool {
+//	if it.cur.Err() != nil || it.i >= len(it.chunks) {
+//		it.clearLast()
+//		return false
+//	}
+//
+//	if it.hasLast() {
+//		it.clearLast()
+//		t, _ := it.cur.At()
+//		return t < it.maxt
+//	}
+//
+//	for {
+//		if it.cur.Next() {
+//			t, _ := it.cur.At()
+//
+//			if t < it.mint {
+//				if !it.Seek(it.mint) {
+//					return false
+//				}
+//				t, _ = it.cur.At()
+//			}
+//
+//			return t <= it.maxt
+//		}
+//		if err := it.cur.Err(); err != nil {
+//			return false
+//		}
+//
+//		it.i++
+//		if it.i == len(it.chunks) {
+//			return false
+//		}
+//		it.cur = it.chunkIterator(it.i)
+//	}
+//
+//	return false
+//}
+//
+//func (it *chunkSeriesIteratorB) Err() error {
+//	return it.cur.Err()
+//}
+//
+//func (it *chunkSeriesIteratorB) hasLast() bool {
+//	return it.lastT != math.MinInt64
+//}
+//
+//func (it *chunkSeriesIteratorB) clearLast() {
+//	it.lastT = math.MinInt64
+//}
 
 // deletedIterator wraps an Iterator and makes sure any deleted metrics are not
 // returned.
