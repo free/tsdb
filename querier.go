@@ -861,8 +861,8 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 
 func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 	//	{
-	//		t0, _ := it.cur.At()
-	//		fmt.Printf("SeekInstant(%d), t0=%d lastT=%d\n", t, t0, it.lastT)
+	//		t0, v0 := it.cur.At()
+	//		fmt.Printf("SeekInstant(%d), t0=%d, v0=%f lastT=%d\n", t, t0, v0, it.lastT)
 	//	}
 	if it.cur.Err() != nil {
 		return false
@@ -897,7 +897,7 @@ func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 		if t0 == t {
 			it.clearLast()
 		}
-		//		fmt.Printf("  early return 2 lastT=%d t0=%d\n", it.lastT, t0)
+		//		fmt.Printf("  early return 2 lastT=%d t0=%d v0=%f\n", it.lastT, t0, v0)
 		return true
 	}
 
@@ -942,7 +942,7 @@ Outer:
 	t0, _ := it.cur.At()
 	//	fmt.Printf("    t0=%d lastT=%d\n", t0, it.lastT)
 	if it.hasLast() {
-		//		fmt.Printf("  returning last value from same chunk lastT=%d\n", it.lastT)
+		//		fmt.Printf("  returning last value from same chunk lastT=%d lastV=%f\n", it.lastT, it.lastV)
 		return true
 	}
 	// First sample in chunk, scan skipped chunks for last value.
