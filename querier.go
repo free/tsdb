@@ -841,7 +841,7 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 			continue
 		}
 
-		// Reset the iterator if we've moved on to a different chunk.
+		// Reset the iterator when moving on to the next chunk.
 		if it.i != iCur {
 			it.cur = it.chunkIterator(it.i)
 		}
@@ -860,39 +860,51 @@ func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
 }
 
 func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
-	fmt.Printf("Seek(%d)\n", t)
-	if it.cur.Err() != nil || (it.i >= len(it.chunks) && !it.hasLast()) {
+	//	{
+	//		t0, _ := it.cur.At()
+	//		fmt.Printf("SeekInstant(%d), t0=%d lastT=%d\n", t, t0, it.lastT)
+	//	}
+	if it.cur.Err() != nil {
 		return false
 	}
 
-	// Fail if seeking beyond maxt.
 	if t > it.maxt {
+		// Fail early when seeking beyond maxt.
 		it.i = len(it.chunks)
 		it.clearLast()
+		//		fmt.Printf("  early return, seeking past maxt\n")
 		return false
 	}
 
-	// If iterator is done but have last value, return success.
 	if it.i >= len(it.chunks) {
+		// Iterator is done, return success iff we have last value.
+		//		fmt.Printf("  early return, iterator done\n")
 		return it.hasLast()
 	}
 
 	if t < it.mint {
-		// Seek to the first valid value after mint.
+		// Seek to the first value after mint instead.
+		//		fmt.Printf("  Seek(%d)\n", it.mint)
 		return it.Seek(it.mint)
 	}
 
 	// Return early if already past t.
 	if it.lastT >= t {
+		//		fmt.Printf("  early return 1 lastT=%d\n", it.lastT)
 		return true
 	}
 	if t0, _ := it.cur.At(); t0 >= t {
-		return it.hasLast()
+		if t0 == t {
+			it.clearLast()
+		}
+		//		fmt.Printf("  early return 2 lastT=%d t0=%d\n", it.lastT, t0)
+		return true
 	}
 
 	iCur := it.i
 	itCur := it.cur
 	it.lastT, it.lastV = it.cur.At()
+Outer:
 	for ; it.i < len(it.chunks); it.i++ {
 		// Skip chunks with MaxTime < t, initially.
 		if it.chunks[it.i].MaxTime < t {
@@ -900,10 +912,10 @@ func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 			continue
 		}
 
-		// Reset the iterator if we've moved on to a different chunk.
+		// Reset the iterator when moving on to the next chunk.
 		if it.i != iCur {
-			tt, vv := it.cur.At()
-			fmt.Printf("Seek(%d): lastT=%d it.cur.At=%d %f\n", t, it.lastT, tt, vv)
+			//			tt, _ := it.cur.At()
+			//			fmt.Printf("    lastT=%d it.cur.At=%d\n", it.lastT, tt)
 			it.cur = it.chunkIterator(it.i)
 		}
 
@@ -917,39 +929,49 @@ func (it *chunkSeriesIterator) SeekInstant(t int64) (ok bool) {
 				continue
 			}
 			if t0 == t {
+				//				fmt.Printf("  exact match, clear lastT\n")
 				it.clearLast()
 				return true
 			}
 			// t0 > t
-			fmt.Printf("Seek(%d): t0=%d lastT=%d\n", t, t0, it.lastT)
-			if it.hasLast() {
-				return true
-			}
-			// First sample in chunk, scan back skipped chunks for last value.
-			for j := it.i - 1; j >= iCur; j-- {
-				var itb chunkenc.Iterator
-				if j != iCur {
-					itb = it.chunkIterator(j)
-				} else {
-					itb = itCur
-				}
-				// This only works because outside of this code, it.cur (and thus itb) is either:
-				//  (a) unpositioned, returning math.MinInt64;
-				//  (b) positioned on a valid value after Seek/SeekInstant/Next return;
-				//  (c) positioned on an invalid (e.g. deleted) value iff it.i == len(it.chunks);
-				it.lastT, it.lastV = itb.At()
-				for itb.Next() {
-					it.lastT, it.lastV = itb.At()
-				}
-				if it.hasLast() {
-					return true
-				}
-			}
-			// Zero samples in skipped chunks, seek forward instead.
-			return t0 <= it.maxt
+			break Outer
 		}
 	}
-	return it.hasLast()
+
+	// At this point we're either past t (but before maxt) or the iterator is done.
+	t0, _ := it.cur.At()
+	//	fmt.Printf("    t0=%d lastT=%d\n", t0, it.lastT)
+	if it.hasLast() {
+		//		fmt.Printf("  returning last value from same chunk lastT=%d\n", it.lastT)
+		return true
+	}
+	// First sample in chunk, scan skipped chunks for last value.
+	for j := it.i - 1; j >= iCur; j-- {
+		var itb chunkenc.Iterator
+		if j != iCur {
+			itb = it.chunkIterator(j)
+		} else {
+			itb = itCur
+		}
+		// This only works because outside of this code, it.cur (and thus itb) is either:
+		//  (a) unpositioned, returning math.MinInt64;
+		//  (b) positioned on a valid value after Seek/SeekInstant/Next return;
+		//  (c) positioned on an invalid (e.g. deleted) value iff it.i == len(it.chunks);
+		it.lastT, it.lastV = itb.At()
+		for itb.Next() {
+			it.lastT, it.lastV = itb.At()
+		}
+		if it.hasLast() {
+			//			fmt.Printf("  returning last value from previous chunk lastT=%d\n", it.lastT)
+			return true
+		}
+	}
+	// Zero samples in skipped chunks, seek forward instead.
+	// This code is actually never reached, as there is always a last value
+	// (in the worst case, the one the iterator was positioned on when we got
+	// called) but is here just in case (and to make the compiler happy).
+	//	fmt.Printf(" -> zero samples in skipped chunks, seeking forward t0=%d\n", t0)
+	return t0 <= it.maxt
 }
 
 func (it *chunkSeriesIterator) At() (t int64, v float64) {

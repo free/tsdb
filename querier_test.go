@@ -1263,28 +1263,83 @@ func TestChunkSeriesIterator_SeekInstant(t *testing.T) {
 	testutil.Equals(t, 0.0, v)
 	testutil.Equals(t, nil, it.Err())
 
+	// SeekInstant advances to the first value, when after t.
 	testutil.Assert(t, it.SeekInstant(10), "")
 	ts, v = it.At()
 	testutil.Equals(t, int64(13), ts)
 	testutil.Equals(t, 14.0, v)
 
-	// Test iterator doesn't advance.
+	// SeekInstant should buffer, but not advance.
 	testutil.Assert(t, it.SeekInstant(14), "")
 	ts, v = it.At()
 	testutil.Equals(t, int64(13), ts)
 	testutil.Equals(t, 14.0, v)
 
-	// Test iterator advances when buffering a last value.
+	// SeekInstant advances correctly when buffering a last value.
 	testutil.Assert(t, it.SeekInstant(16), "")
 	ts, v = it.At()
 	testutil.Equals(t, int64(15), ts)
 	testutil.Equals(t, 16.0, v)
 
-	// Test iterator doesn't advance when buffering a last value.
-	testutil.Assert(t, it.SeekInstant(16), "")
+	// SeekInstant doesn't advance when seeking a smaller t.
+	testutil.Assert(t, it.SeekInstant(13), "")
 	ts, v = it.At()
 	testutil.Equals(t, int64(15), ts)
 	testutil.Equals(t, 16.0, v)
+
+	// SeekInstant doesn't advance when buffering a last value.
+	testutil.Assert(t, it.SeekInstant(30), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(15), ts)
+	testutil.Equals(t, 16.0, v)
+
+	// Seek doesn't advance when buffering a last value.
+	testutil.Assert(t, it.Seek(15), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(15), ts)
+	testutil.Equals(t, 16.0, v)
+
+	// Seek drops buffered value, but doesn't advance.
+	testutil.Assert(t, it.Seek(30), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(31), ts)
+	testutil.Equals(t, 32.0, v)
+
+	// Test iterator doesn't advance when buffering a last value.
+	testutil.Assert(t, it.SeekInstant(15), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(31), ts)
+	testutil.Equals(t, 32.0, v)
+
+	// SeekInstant first value in chunk returns previous value.
+	testutil.Assert(t, it.SeekInstant(50), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(35), ts)
+	testutil.Equals(t, 36.0, v)
+
+	// SeekInstant for exact value.
+	testutil.Assert(t, it.SeekInstant(53), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(53), ts)
+	testutil.Equals(t, 54.0, v)
+
+	// SeekInstant buffers last value, even if iterator is done.
+	testutil.Assert(t, it.SeekInstant(54), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(53), ts)
+	testutil.Equals(t, 54.0, v)
+
+	// Seek returns buffered value when iterator is spent.
+	testutil.Assert(t, it.Seek(53), "")
+	ts, v = it.At()
+	testutil.Equals(t, int64(53), ts)
+	testutil.Equals(t, 54.0, v)
+
+	// SeekInstant past maxt clears buffered valus and terminates iterator.
+	testutil.Assert(t, !it.SeekInstant(55), "")
+
+	// SeekInstant fails on spent iterator.
+	testutil.Assert(t, !it.SeekInstant(54), "")
 }
 
 func TestPopulatedCSReturnsValidChunkSlice(t *testing.T) {
