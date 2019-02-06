@@ -14,6 +14,7 @@
 package tsdb
 
 import (
+	"fmt"
 	"io"
 	"math/rand"
 	"os"
@@ -26,12 +27,14 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/tsdb/chunks"
 	"github.com/prometheus/tsdb/fileutil"
+	"github.com/prometheus/tsdb/index"
 	"github.com/prometheus/tsdb/labels"
 )
 
-// ExponentialBlockRanges returns the time ranges based on the stepSize
+// ExponentialBlockRanges returns the time ranges based on the stepSize.
 func ExponentialBlockRanges(minSize int64, steps, stepSize int) []int64 {
 	ranges := make([]int64, 0, steps)
 	curRange := minSize
@@ -52,11 +55,18 @@ type Compactor interface {
 	Plan(dir string) ([]string, error)
 
 	// Write persists a Block into a directory.
-	Write(dest string, b BlockReader, mint, maxt int64) error
+	// No Block is written when resulting Block has 0 samples, and returns empty ulid.ULID{}.
+	Write(dest string, b BlockReader, mint, maxt int64, parent *BlockMeta) (ulid.ULID, error)
 
 	// Compact runs compaction against the provided directories. Must
 	// only be called concurrently with results of Plan().
-	Compact(dest string, dirs ...string) error
+	// Can optionally pass a list of already open blocks,
+	// to avoid having to reopen them.
+	// When resulting Block has 0 samples
+	//  * No block is written.
+	//  * The source dirs are marked Deletable.
+	//  * Returns empty ulid.ULID{}.
+	Compact(dest string, dirs []string, open []*Block) (ulid.ULID, error)
 }
 
 // LeveledCompactor implements the Compactor interface.
@@ -65,7 +75,7 @@ type LeveledCompactor struct {
 	metrics   *compactorMetrics
 	logger    log.Logger
 	ranges    []int64
-	chunkPool chunks.Pool
+	chunkPool chunkenc.Pool
 }
 
 type compactorMetrics struct {
@@ -81,30 +91,30 @@ func newCompactorMetrics(r prometheus.Registerer) *compactorMetrics {
 	m := &compactorMetrics{}
 
 	m.ran = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tsdb_compactions_total",
+		Name: "prometheus_tsdb_compactions_total",
 		Help: "Total number of compactions that were executed for the partition.",
 	})
 	m.failed = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "tsdb_compactions_failed_total",
+		Name: "prometheus_tsdb_compactions_failed_total",
 		Help: "Total number of compactions that failed for the partition.",
 	})
 	m.duration = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "tsdb_compaction_duration",
-		Help:    "Duration of compaction runs.",
+		Name:    "prometheus_tsdb_compaction_duration_seconds",
+		Help:    "Duration of compaction runs",
 		Buckets: prometheus.ExponentialBuckets(1, 2, 10),
 	})
 	m.chunkSize = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "tsdb_compaction_chunk_size",
+		Name:    "prometheus_tsdb_compaction_chunk_size_bytes",
 		Help:    "Final size of chunks on their first compaction",
 		Buckets: prometheus.ExponentialBuckets(32, 1.5, 12),
 	})
 	m.chunkSamples = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "tsdb_compaction_chunk_samples",
+		Name:    "prometheus_tsdb_compaction_chunk_samples",
 		Help:    "Final number of samples on their first compaction",
 		Buckets: prometheus.ExponentialBuckets(4, 1.5, 12),
 	})
 	m.chunkRange = prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "tsdb_compaction_chunk_range",
+		Name:    "prometheus_tsdb_compaction_chunk_range_seconds",
 		Help:    "Final time range of chunks on their first compaction",
 		Buckets: prometheus.ExponentialBuckets(100, 4, 10),
 	})
@@ -123,12 +133,12 @@ func newCompactorMetrics(r prometheus.Registerer) *compactorMetrics {
 }
 
 // NewLeveledCompactor returns a LeveledCompactor.
-func NewLeveledCompactor(r prometheus.Registerer, l log.Logger, ranges []int64, pool chunks.Pool) (*LeveledCompactor, error) {
+func NewLeveledCompactor(r prometheus.Registerer, l log.Logger, ranges []int64, pool chunkenc.Pool) (*LeveledCompactor, error) {
 	if len(ranges) == 0 {
 		return nil, errors.Errorf("at least one range must be provided")
 	}
 	if pool == nil {
-		pool = chunks.NewPool()
+		pool = chunkenc.NewPool()
 	}
 	return &LeveledCompactor{
 		ranges:    ranges,
@@ -149,9 +159,11 @@ func (c *LeveledCompactor) Plan(dir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(dirs) < 1 {
+		return nil, nil
+	}
 
 	var dms []dirMeta
-
 	for _, dir := range dirs {
 		meta, err := readMetaFile(dir)
 		if err != nil {
@@ -167,6 +179,10 @@ func (c *LeveledCompactor) plan(dms []dirMeta) ([]string, error) {
 		return dms[i].meta.MinTime < dms[j].meta.MinTime
 	})
 
+	// We do not include a recently created block with max(minTime), so the block which was just created from WAL.
+	// This gives users a window of a full block size to piece-wise backup new data without having to care about data overlap.
+	dms = dms[:len(dms)-1]
+
 	var res []string
 	for _, dm := range c.selectDirs(dms) {
 		res = append(res, dm.dir)
@@ -175,13 +191,12 @@ func (c *LeveledCompactor) plan(dms []dirMeta) ([]string, error) {
 		return res, nil
 	}
 
-	// Compact any blocks that have >5% tombstones.
+	// Compact any blocks with big enough time range that have >5% tombstones.
 	for i := len(dms) - 1; i >= 0; i-- {
 		meta := dms[i].meta
 		if meta.MaxTime-meta.MinTime < c.ranges[len(c.ranges)/2] {
 			break
 		}
-
 		if float64(meta.Stats.NumTombstones)/float64(meta.Stats.NumSeries+1) > 0.05 {
 			return []string{dms[i].dir}, nil
 		}
@@ -205,7 +220,15 @@ func (c *LeveledCompactor) selectDirs(ds []dirMeta) []dirMeta {
 			continue
 		}
 
+	Outer:
 		for _, p := range parts {
+			// Do not select the range if it has a block whose compaction failed.
+			for _, dm := range p {
+				if dm.meta.Compaction.Failed {
+					continue Outer
+				}
+			}
+
 			mint := p[0].meta.MinTime
 			maxt := p[len(p)-1].meta.MaxTime
 			// Pick the range of blocks if it spans the full range (potentially with gaps)
@@ -280,6 +303,11 @@ func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 		for _, s := range b.Compaction.Sources {
 			sources[s] = struct{}{}
 		}
+		res.Compaction.Parents = append(res.Compaction.Parents, BlockDesc{
+			ULID:    b.ULID,
+			MinTime: b.MinTime,
+			MaxTime: b.MaxTime,
+		})
 	}
 	res.Compaction.Level++
 
@@ -295,33 +323,99 @@ func compactBlockMetas(uid ulid.ULID, blocks ...*BlockMeta) *BlockMeta {
 
 // Compact creates a new block in the compactor's directory from the blocks in the
 // provided directories.
-func (c *LeveledCompactor) Compact(dest string, dirs ...string) (err error) {
-	var blocks []BlockReader
-	var metas []*BlockMeta
+func (c *LeveledCompactor) Compact(dest string, dirs []string, open []*Block) (uid ulid.ULID, err error) {
+	var (
+		blocks []BlockReader
+		bs     []*Block
+		metas  []*BlockMeta
+		uids   []string
+	)
+	start := time.Now()
 
 	for _, d := range dirs {
-		b, err := OpenBlock(d, c.chunkPool)
-		if err != nil {
-			return err
-		}
-		defer b.Close()
-
 		meta, err := readMetaFile(d)
 		if err != nil {
-			return err
+			return uid, err
+		}
+
+		var b *Block
+
+		// Use already open blocks if we can, to avoid
+		// having the index data in memory twice.
+		for _, o := range open {
+			if meta.ULID == o.Meta().ULID {
+				b = o
+				break
+			}
+		}
+
+		if b == nil {
+			var err error
+			b, err = OpenBlock(c.logger, d, c.chunkPool)
+			if err != nil {
+				return uid, err
+			}
+			defer b.Close()
 		}
 
 		metas = append(metas, meta)
 		blocks = append(blocks, b)
+		bs = append(bs, b)
+		uids = append(uids, meta.ULID.String())
 	}
 
 	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
-	uid := ulid.MustNew(ulid.Now(), entropy)
+	uid = ulid.MustNew(ulid.Now(), entropy)
 
-	return c.write(dest, compactBlockMetas(uid, metas...), blocks...)
+	meta := compactBlockMetas(uid, metas...)
+	err = c.write(dest, meta, blocks...)
+	if err == nil {
+		if meta.Stats.NumSamples == 0 {
+			for _, b := range bs {
+				b.meta.Compaction.Deletable = true
+				if err = writeMetaFile(b.dir, &b.meta); err != nil {
+					level.Error(c.logger).Log(
+						"msg", "Failed to write 'Deletable' to meta file after compaction",
+						"ulid", b.meta.ULID,
+					)
+				}
+			}
+			uid = ulid.ULID{}
+			level.Info(c.logger).Log(
+				"msg", "compact blocks resulted in empty block",
+				"count", len(blocks),
+				"sources", fmt.Sprintf("%v", uids),
+				"duration", time.Since(start),
+			)
+		} else {
+			level.Info(c.logger).Log(
+				"msg", "compact blocks",
+				"count", len(blocks),
+				"mint", meta.MinTime,
+				"maxt", meta.MaxTime,
+				"ulid", meta.ULID,
+				"sources", fmt.Sprintf("%v", uids),
+				"duration", time.Since(start),
+			)
+		}
+		return uid, nil
+	}
+
+	var merr MultiError
+	merr.Add(err)
+
+	for _, b := range bs {
+		if err := b.setCompactionFailed(); err != nil {
+			merr.Add(errors.Wrapf(err, "setting compaction failed for block: %s", b.Dir()))
+		}
+	}
+
+	return uid, merr
 }
 
-func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64) error {
+func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64, parent *BlockMeta) (ulid.ULID, error) {
+	start := time.Now()
+
 	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 	uid := ulid.MustNew(ulid.Now(), entropy)
 
@@ -333,7 +427,29 @@ func (c *LeveledCompactor) Write(dest string, b BlockReader, mint, maxt int64) e
 	meta.Compaction.Level = 1
 	meta.Compaction.Sources = []ulid.ULID{uid}
 
-	return c.write(dest, meta, b)
+	if parent != nil {
+		meta.Compaction.Parents = []BlockDesc{
+			{ULID: parent.ULID, MinTime: parent.MinTime, MaxTime: parent.MaxTime},
+		}
+	}
+
+	err := c.write(dest, meta, b)
+	if err != nil {
+		return uid, err
+	}
+
+	if meta.Stats.NumSamples == 0 {
+		return ulid.ULID{}, nil
+	}
+
+	level.Info(c.logger).Log(
+		"msg", "write block",
+		"mint", meta.MinTime,
+		"maxt", meta.MaxTime,
+		"ulid", meta.ULID,
+		"duration", time.Since(start),
+	)
+	return uid, nil
 }
 
 // instrumentedChunkWriter is used for level 1 compactions to record statistics
@@ -346,7 +462,7 @@ type instrumentedChunkWriter struct {
 	trange  prometheus.Histogram
 }
 
-func (w *instrumentedChunkWriter) WriteChunks(chunks ...ChunkMeta) error {
+func (w *instrumentedChunkWriter) WriteChunks(chunks ...chunks.Meta) error {
 	for _, c := range chunks {
 		w.size.Observe(float64(len(c.Chunk.Bytes())))
 		w.samples.Observe(float64(c.Chunk.NumSamples()))
@@ -358,18 +474,20 @@ func (w *instrumentedChunkWriter) WriteChunks(chunks ...ChunkMeta) error {
 // write creates a new block that is the union of the provided blocks into dir.
 // It cleans up all files of the old blocks after completing successfully.
 func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockReader) (err error) {
-	level.Info(c.logger).Log("msg", "compact blocks", "count", len(blocks), "mint", meta.MinTime, "maxt", meta.MaxTime)
+	dir := filepath.Join(dest, meta.ULID.String())
+	tmp := dir + ".tmp"
 
 	defer func(t time.Time) {
 		if err != nil {
 			c.metrics.failed.Inc()
+			// TODO(gouthamve): Handle error how?
+			if err := os.RemoveAll(tmp); err != nil {
+				level.Error(c.logger).Log("msg", "removed tmp folder after failed compaction", "err", err.Error())
+			}
 		}
 		c.metrics.ran.Inc()
 		c.metrics.duration.Observe(time.Since(t).Seconds())
 	}(time.Now())
-
-	dir := filepath.Join(dest, meta.ULID.String())
-	tmp := dir + ".tmp"
 
 	if err = os.RemoveAll(tmp); err != nil {
 		return err
@@ -383,10 +501,11 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 	// data of all blocks.
 	var chunkw ChunkWriter
 
-	chunkw, err = newChunkWriter(chunkDir(tmp))
+	chunkw, err = chunks.NewWriter(chunkDir(tmp))
 	if err != nil {
 		return errors.Wrap(err, "open chunk writer")
 	}
+	defer chunkw.Close()
 	// Record written chunk sizes on level 1 compactions.
 	if meta.Compaction.Level == 1 {
 		chunkw = &instrumentedChunkWriter{
@@ -397,19 +516,19 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 		}
 	}
 
-	indexw, err := newIndexWriter(tmp)
+	indexw, err := index.NewWriter(filepath.Join(tmp, indexFilename))
 	if err != nil {
 		return errors.Wrap(err, "open index writer")
 	}
+	defer indexw.Close()
 
 	if err := c.populateBlock(blocks, meta, indexw, chunkw); err != nil {
 		return errors.Wrap(err, "write compaction")
 	}
-
-	if err = writeMetaFile(tmp, meta); err != nil {
-		return errors.Wrap(err, "write merged meta")
-	}
-
+	// We are explicitly closing them here to check for error even
+	// though these are covered under defer. This is because in Windows,
+	// you cannot delete these unless they are closed and the defer is to
+	// make sure they are closed if the function exits due to an error above.
 	if err = chunkw.Close(); err != nil {
 		return errors.Wrap(err, "close chunk writer")
 	}
@@ -417,8 +536,20 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 		return errors.Wrap(err, "close index writer")
 	}
 
+	// Populated block is empty, so cleanup and exit.
+	if meta.Stats.NumSamples == 0 {
+		if err := os.RemoveAll(tmp); err != nil {
+			return errors.Wrap(err, "remove tmp folder after empty block failed")
+		}
+		return nil
+	}
+
+	if err = writeMetaFile(tmp, meta); err != nil {
+		return errors.Wrap(err, "write merged meta")
+	}
+
 	// Create an empty tombstones file.
-	if err := writeTombstoneFile(tmp, newEmptyTombstoneReader()); err != nil {
+	if err := writeTombstoneFile(tmp, newMemTombstones()); err != nil {
 		return errors.Wrap(err, "write new tombstones file")
 	}
 
@@ -426,24 +557,39 @@ func (c *LeveledCompactor) write(dest string, meta *BlockMeta, blocks ...BlockRe
 	if err != nil {
 		return errors.Wrap(err, "open temporary block dir")
 	}
-	defer df.Close()
+	defer func() {
+		if df != nil {
+			df.Close()
+		}
+	}()
 
 	if err := fileutil.Fsync(df); err != nil {
 		return errors.Wrap(err, "sync temporary dir file")
 	}
 
+	// Close temp dir before rename block dir (for windows platform).
+	if err = df.Close(); err != nil {
+		return errors.Wrap(err, "close temporary dir")
+	}
+	df = nil
+
 	// Block successfully written, make visible and remove old ones.
 	if err := renameFile(tmp, dir); err != nil {
 		return errors.Wrap(err, "rename block dir")
 	}
+
 	return nil
 }
 
 // populateBlock fills the index and chunk writers with new data gathered as the union
 // of the provided blocks. It returns meta information for the new block.
 func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, indexw IndexWriter, chunkw ChunkWriter) error {
+	if len(blocks) == 0 {
+		return errors.New("cannot populate block from no readers")
+	}
+
 	var (
-		set        compactionSet
+		set        ChunkSeriesSet
 		allSymbols = make(map[string]struct{}, 1<<16)
 		closers    = []io.Closer{}
 	)
@@ -476,7 +622,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			allSymbols[s] = struct{}{}
 		}
 
-		all, err := indexr.Postings(allPostingsKey.Name, allPostingsKey.Value)
+		all, err := indexr.Postings(index.AllPostingsKey())
 		if err != nil {
 			return err
 		}
@@ -496,7 +642,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 
 	// We fully rebuild the postings list index from merged series.
 	var (
-		postings = newMemPostings()
+		postings = index.NewMemPostings()
 		values   = map[string]stringset{}
 		i        = uint64(0)
 	)
@@ -513,26 +659,33 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			continue
 		}
 
-		if len(dranges) > 0 {
-			// Re-encode the chunk to not have deleted values.
-			for _, chk := range chks {
-				if intervalOverlap(dranges[0].Mint, dranges[len(dranges)-1].Maxt, chk.MinTime, chk.MaxTime) {
-					newChunk := chunks.NewXORChunk()
-					app, err := newChunk.Appender()
-					if err != nil {
-						return err
-					}
+		for i, chk := range chks {
+			if chk.MinTime < meta.MinTime || chk.MaxTime > meta.MaxTime {
+				return errors.Errorf("found chunk with minTime: %d maxTime: %d outside of compacted minTime: %d maxTime: %d",
+					chk.MinTime, chk.MaxTime, meta.MinTime, meta.MaxTime)
+			}
 
-					it := &deletedIterator{it: chk.Chunk.Iterator(), intervals: dranges}
-					for it.Next() {
-						ts, v := it.At()
-						app.Append(ts, v)
-					}
-
-					chk.Chunk = newChunk
+			if len(dranges) > 0 {
+				// Re-encode the chunk to not have deleted values.
+				if !chk.OverlapsClosedInterval(dranges[0].Mint, dranges[len(dranges)-1].Maxt) {
+					continue
 				}
+				newChunk := chunkenc.NewXORChunk()
+				app, err := newChunk.Appender()
+				if err != nil {
+					return err
+				}
+
+				it := &deletedIterator{it: chk.Chunk.Iterator(), intervals: dranges}
+				for it.Next() {
+					ts, v := it.At()
+					app.Append(ts, v)
+				}
+
+				chks[i].Chunk = newChunk
 			}
 		}
+
 		if err := chunkw.WriteChunks(chks...); err != nil {
 			return errors.Wrap(err, "write chunks")
 		}
@@ -548,7 +701,9 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		}
 
 		for _, chk := range chks {
-			c.chunkPool.Put(chk.Chunk)
+			if err := c.chunkPool.Put(chk.Chunk); err != nil {
+				return errors.Wrap(err, "put chunk")
+			}
 		}
 
 		for _, l := range lset {
@@ -559,7 +714,7 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 			}
 			valset.set(l.Value)
 		}
-		postings.add(i, lset)
+		postings.Add(i, lset)
 
 		i++
 	}
@@ -579,34 +734,27 @@ func (c *LeveledCompactor) populateBlock(blocks []BlockReader, meta *BlockMeta, 
 		}
 	}
 
-	for l := range postings.m {
-		if err := indexw.WritePostings(l.Name, l.Value, postings.get(l.Name, l.Value)); err != nil {
+	for _, l := range postings.SortedKeys() {
+		if err := indexw.WritePostings(l.Name, l.Value, postings.Get(l.Name, l.Value)); err != nil {
 			return errors.Wrap(err, "write postings")
 		}
 	}
 	return nil
 }
 
-type compactionSet interface {
-	Next() bool
-	At() (labels.Labels, []ChunkMeta, Intervals)
-	Err() error
-}
-
 type compactionSeriesSet struct {
-	p          Postings
+	p          index.Postings
 	index      IndexReader
 	chunks     ChunkReader
 	tombstones TombstoneReader
-	series     SeriesSet
 
 	l         labels.Labels
-	c         []ChunkMeta
+	c         []chunks.Meta
 	intervals Intervals
 	err       error
 }
 
-func newCompactionSeriesSet(i IndexReader, c ChunkReader, t TombstoneReader, p Postings) *compactionSeriesSet {
+func newCompactionSeriesSet(i IndexReader, c ChunkReader, t TombstoneReader, p index.Postings) *compactionSeriesSet {
 	return &compactionSeriesSet{
 		index:      i,
 		chunks:     c,
@@ -621,7 +769,11 @@ func (c *compactionSeriesSet) Next() bool {
 	}
 	var err error
 
-	c.intervals = c.tombstones.Get(c.p.At())
+	c.intervals, err = c.tombstones.Get(c.p.At())
+	if err != nil {
+		c.err = errors.Wrap(err, "get tombstones")
+		return false
+	}
 
 	if err = c.index.Series(c.p.At(), &c.l, &c.c); err != nil {
 		c.err = errors.Wrapf(err, "get series %d", c.p.At())
@@ -630,7 +782,7 @@ func (c *compactionSeriesSet) Next() bool {
 
 	// Remove completely deleted chunks.
 	if len(c.intervals) > 0 {
-		chks := make([]ChunkMeta, 0, len(c.c))
+		chks := make([]chunks.Meta, 0, len(c.c))
 		for _, chk := range c.c {
 			if !(Interval{chk.MinTime, chk.MaxTime}.isSubrange(c.intervals)) {
 				chks = append(chks, chk)
@@ -660,25 +812,20 @@ func (c *compactionSeriesSet) Err() error {
 	return c.p.Err()
 }
 
-func (c *compactionSeriesSet) At() (labels.Labels, []ChunkMeta, Intervals) {
+func (c *compactionSeriesSet) At() (labels.Labels, []chunks.Meta, Intervals) {
 	return c.l, c.c, c.intervals
 }
 
 type compactionMerger struct {
-	a, b compactionSet
+	a, b ChunkSeriesSet
 
 	aok, bok  bool
 	l         labels.Labels
-	c         []ChunkMeta
+	c         []chunks.Meta
 	intervals Intervals
 }
 
-type compactionSeries struct {
-	labels labels.Labels
-	chunks []*ChunkMeta
-}
-
-func newCompactionMerger(a, b compactionSet) (*compactionMerger, error) {
+func newCompactionMerger(a, b ChunkSeriesSet) (*compactionMerger, error) {
 	c := &compactionMerger{
 		a: a,
 		b: b,
@@ -710,10 +857,9 @@ func (c *compactionMerger) Next() bool {
 	// While advancing child iterators the memory used for labels and chunks
 	// may be reused. When picking a series we have to store the result.
 	var lset labels.Labels
-	var chks []ChunkMeta
+	var chks []chunks.Meta
 
 	d := c.compare()
-	// Both sets contain the current series. Chain them into a single one.
 	if d > 0 {
 		lset, chks, c.intervals = c.b.At()
 		c.l = append(c.l[:0], lset...)
@@ -727,8 +873,10 @@ func (c *compactionMerger) Next() bool {
 
 		c.aok = c.a.Next()
 	} else {
+		// Both sets contain the current series. Chain them into a single one.
 		l, ca, ra := c.a.At()
 		_, cb, rb := c.b.At()
+
 		for _, r := range rb {
 			ra = ra.add(r)
 		}
@@ -751,7 +899,7 @@ func (c *compactionMerger) Err() error {
 	return c.b.Err()
 }
 
-func (c *compactionMerger) At() (labels.Labels, []ChunkMeta, Intervals) {
+func (c *compactionMerger) At() (labels.Labels, []chunks.Meta, Intervals) {
 	return c.l, c.c, c.intervals
 }
 

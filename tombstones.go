@@ -20,6 +20,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/pkg/errors"
 )
@@ -28,19 +29,27 @@ const tombstoneFilename = "tombstones"
 
 const (
 	// MagicTombstone is 4 bytes at the head of a tombstone file.
-	MagicTombstone = 0x130BA30
+	MagicTombstone = 0x0130BA30
 
 	tombstoneFormatV1 = 1
 )
 
 // TombstoneReader gives access to tombstone intervals by series reference.
 type TombstoneReader interface {
-	Get(ref uint64) Intervals
+	// Get returns deletion intervals for the series with the given reference.
+	Get(ref uint64) (Intervals, error)
 
+	// Iter calls the given function for each encountered interval.
+	Iter(func(uint64, Intervals) error) error
+
+	// Total returns the total count of tombstones.
+	Total() uint64
+
+	// Close any underlying resources
 	Close() error
 }
 
-func writeTombstoneFile(dir string, tr tombstoneReader) error {
+func writeTombstoneFile(dir string, tr TombstoneReader) error {
 	path := filepath.Join(dir, tombstoneFilename)
 	tmp := path + ".tmp"
 	hash := newCRC32()
@@ -49,7 +58,11 @@ func writeTombstoneFile(dir string, tr tombstoneReader) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil {
+			f.Close()
+		}
+	}()
 
 	buf := encbuf{b: make([]byte, 3*binary.MaxVarintLen64)}
 	buf.reset()
@@ -63,18 +76,22 @@ func writeTombstoneFile(dir string, tr tombstoneReader) error {
 
 	mw := io.MultiWriter(f, hash)
 
-	for k, v := range tr {
-		for _, itv := range v {
+	if err := tr.Iter(func(ref uint64, ivs Intervals) error {
+		for _, iv := range ivs {
 			buf.reset()
-			buf.putUvarint64(k)
-			buf.putVarint64(itv.Mint)
-			buf.putVarint64(itv.Maxt)
+
+			buf.putUvarint64(ref)
+			buf.putVarint64(iv.Mint)
+			buf.putVarint64(iv.Maxt)
 
 			_, err = mw.Write(buf.get())
 			if err != nil {
 				return err
 			}
 		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("error writing tombstones: %v", err)
 	}
 
 	_, err = f.Write(hash.Sum(nil))
@@ -82,6 +99,10 @@ func writeTombstoneFile(dir string, tr tombstoneReader) error {
 		return err
 	}
 
+	if err = f.Close(); err != nil {
+		return err
+	}
+	f = nil
 	return renameFile(tmp, path)
 }
 
@@ -92,71 +113,118 @@ type Stone struct {
 	intervals Intervals
 }
 
-func readTombstones(dir string) (tombstoneReader, error) {
+func readTombstones(dir string) (TombstoneReader, SizeReader, error) {
 	b, err := ioutil.ReadFile(filepath.Join(dir, tombstoneFilename))
-	if err != nil {
-		return nil, err
+	if os.IsNotExist(err) {
+		return newMemTombstones(), nil, nil
+	} else if err != nil {
+		return nil, nil, err
+	}
+
+	sr := &TombstoneFile{
+		size: int64(len(b)),
 	}
 
 	if len(b) < 5 {
-		return nil, errors.Wrap(errInvalidSize, "tombstones header")
+		return nil, sr, errors.Wrap(errInvalidSize, "tombstones header")
 	}
 
 	d := &decbuf{b: b[:len(b)-4]} // 4 for the checksum.
 	if mg := d.be32(); mg != MagicTombstone {
-		return nil, fmt.Errorf("invalid magic number %x", mg)
+		return nil, sr, fmt.Errorf("invalid magic number %x", mg)
 	}
 	if flag := d.byte(); flag != tombstoneFormatV1 {
-		return nil, fmt.Errorf("invalid tombstone format %x", flag)
+		return nil, sr, fmt.Errorf("invalid tombstone format %x", flag)
 	}
 
 	if d.err() != nil {
-		return nil, d.err()
+		return nil, sr, d.err()
 	}
 
-	// Verify checksum
+	// Verify checksum.
 	hash := newCRC32()
 	if _, err := hash.Write(d.get()); err != nil {
-		return nil, errors.Wrap(err, "write to hash")
+		return nil, sr, errors.Wrap(err, "write to hash")
 	}
 	if binary.BigEndian.Uint32(b[len(b)-4:]) != hash.Sum32() {
-		return nil, errors.New("checksum did not match")
+		return nil, sr, errors.New("checksum did not match")
 	}
 
-	stonesMap := newEmptyTombstoneReader()
+	stonesMap := newMemTombstones()
+
 	for d.len() > 0 {
 		k := d.uvarint64()
 		mint := d.varint64()
 		maxt := d.varint64()
 		if d.err() != nil {
-			return nil, d.err()
+			return nil, sr, d.err()
 		}
 
-		stonesMap.add(k, Interval{mint, maxt})
+		stonesMap.addInterval(k, Interval{mint, maxt})
 	}
 
-	return newTombstoneReader(stonesMap), nil
+	return stonesMap, sr, nil
 }
 
-type tombstoneReader map[uint64]Intervals
-
-func newTombstoneReader(ts map[uint64]Intervals) tombstoneReader {
-	return tombstoneReader(ts)
+type memTombstones struct {
+	intvlGroups map[uint64]Intervals
+	mtx         sync.RWMutex
 }
 
-func newEmptyTombstoneReader() tombstoneReader {
-	return tombstoneReader(make(map[uint64]Intervals))
+// newMemTombstones creates new in memory TombstoneReader
+// that allows adding new intervals.
+func newMemTombstones() *memTombstones {
+	return &memTombstones{intvlGroups: make(map[uint64]Intervals)}
 }
 
-func (t tombstoneReader) Get(ref uint64) Intervals {
-	return t[ref]
+func (t *memTombstones) Get(ref uint64) (Intervals, error) {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	return t.intvlGroups[ref], nil
 }
 
-func (t tombstoneReader) add(ref uint64, itv Interval) {
-	t[ref] = t[ref].add(itv)
+func (t *memTombstones) Iter(f func(uint64, Intervals) error) error {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+	for ref, ivs := range t.intvlGroups {
+		if err := f(ref, ivs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-func (tombstoneReader) Close() error {
+func (t *memTombstones) Total() uint64 {
+	t.mtx.RLock()
+	defer t.mtx.RUnlock()
+
+	total := uint64(0)
+	for _, ivs := range t.intvlGroups {
+		total += uint64(len(ivs))
+	}
+	return total
+}
+
+// addInterval to an existing memTombstones
+func (t *memTombstones) addInterval(ref uint64, itvs ...Interval) {
+	t.mtx.Lock()
+	defer t.mtx.Unlock()
+	for _, itv := range itvs {
+		t.intvlGroups[ref] = t.intvlGroups[ref].add(itv)
+	}
+}
+
+// TombstoneFile holds information about the tombstone file.
+type TombstoneFile struct {
+	size int64
+}
+
+// Size returns the tombstone file size.
+func (t *TombstoneFile) Size() int64 {
+	return t.size
+}
+
+func (*memTombstones) Close() error {
 	return nil
 }
 
@@ -182,7 +250,7 @@ func (tr Interval) isSubrange(dranges Intervals) bool {
 // Intervals represents	a set of increasing and non-overlapping time-intervals.
 type Intervals []Interval
 
-// This adds the new time-range to the existing ones.
+// add the new time-range to the existing ones.
 // The existing ones must be sorted.
 func (itvs Intervals) add(n Interval) Intervals {
 	for i, r := range itvs {

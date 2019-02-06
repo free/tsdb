@@ -1,12 +1,30 @@
+// Copyright 2018 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package tsdb
 
 import (
 	"encoding/binary"
 	"hash"
+	"hash/crc32"
 	"unsafe"
+
+	"github.com/pkg/errors"
 )
 
-// enbuf is a helper type to populate a byte slice with various types.
+var errInvalidSize = errors.New("invalid size")
+
+// encbuf is a helper type to populate a byte slice with various types.
 type encbuf struct {
 	b []byte
 	c [binary.MaxVarintLen64]byte
@@ -76,6 +94,11 @@ func (d *decbuf) uvarint() int      { return int(d.uvarint64()) }
 func (d *decbuf) uvarint32() uint32 { return uint32(d.uvarint64()) }
 func (d *decbuf) be32int() int      { return int(d.be32()) }
 func (d *decbuf) be64int64() int64  { return int64(d.be64()) }
+
+// crc32 returns a CRC32 checksum over the remaining bytes.
+func (d *decbuf) crc32() uint32 {
+	return crc32.Checksum(d.b, castagnoliTable)
+}
 
 func (d *decbuf) uvarintStr() string {
 	l := d.uvarint64()

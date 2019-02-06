@@ -1,19 +1,24 @@
-sudo: false
-
+# sudo is enabled because it provides more memory which was needed to run go test -race
+sudo: required
+dist: trusty
 language: go
+os:
+  - windows
+  - linux
+  - osx
 
 go:
-- 1.8.x
+  - 1.10.x
+  - 1.11.x
 
 go_import_path: github.com/prometheus/tsdb
 
+before_install:
+  - if [[ "$TRAVIS_OS_NAME" == "windows" ]]; then choco install make; fi
+
 install:
-# Hack until the dev-2.0 branch becomes master.
-- go get -d github.com/prometheus/prometheus/...
-- (cd $GOPATH/src/github.com/prometheus/prometheus && git checkout dev-2.0)
-- go get -t ./...
+  - make deps
 
 script:
-- go test -timeout 5m ./...
-
-
+  # `staticcheck` target is omitted due to linting errors
+  - if [[ "$TRAVIS_OS_NAME" == "windows" ]]; then make test; else make; fi
